@@ -67,6 +67,8 @@ Everything via env vars:
 
 ## Build + run
 
+### Local (Go)
+
 ```bash
 mise install            # Go 1.24 + golangci-lint + lefthook
 go build -o gha-nomad-dispatcher .
@@ -74,12 +76,28 @@ go build -o gha-nomad-dispatcher .
 
 ```bash
 export GITHUB_WEBHOOK_SECRET=...
-export TOKEN_SERVER_URL=http://token-server.lab:8080
+export TOKEN_SERVER_URL=http://gha-token-server.lab:8080
 export NOMAD_ADDR=http://nomad-server.lab:4646
-export RUNNER_IMAGE=ghcr.io/myorg/actions-runner:latest
+export RUNNER_IMAGE=ghcr.io/nkg/oci-actions-runner:v0.1.0
 export RUNNER_LABELS=self-hosted,linux,x64,podman
 ./gha-nomad-dispatcher
 ```
+
+### Container
+
+```bash
+docker run --rm \
+  -p 8080:8080 \
+  -e GITHUB_WEBHOOK_SECRET=... \
+  -e TOKEN_SERVER_URL=http://gha-token-server.lab:8080 \
+  -e NOMAD_ADDR=http://nomad-server.lab:4646 \
+  -e RUNNER_IMAGE=ghcr.io/nkg/oci-actions-runner:v0.1.0 \
+  -e RUNNER_LABELS=self-hosted,linux,x64,podman \
+  ghcr.io/nkg/gha-nomad-dispatcher:v0.1.0
+```
+
+After a tag is pushed, the release workflow publishes multi-arch
+images (`linux/amd64` + `linux/arm64`).
 
 ## Tests
 

@@ -1,0 +1,8 @@
+# Pinned toolchain. After cloning:
+#   mise install
+#   lefthook install
+
+[tools]
+go = "1.24"
+golangci-lint = "1"
+lefthook = "1"

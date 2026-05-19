@@ -149,10 +149,9 @@ func (s *server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 // the Nomad job HCL, submit it. Returns nil on success.
 func (s *server) dispatch(ctx context.Context, log *slog.Logger, ev *webhook.WorkflowJob) error {
 	org := ev.Repository.Owner.Login
-	repo := ev.Repository.Name
 	log = log.With("repo", ev.Repository.FullName, "job_id", ev.WorkflowJob.ID)
 
-	tok, err := s.tokens.MintRegistrationToken(ctx, org, repo)
+	tok, err := s.tokens.MintRegistrationToken(ctx, org)
 	if err != nil {
 		return fmt.Errorf("mint token: %w", err)
 	}

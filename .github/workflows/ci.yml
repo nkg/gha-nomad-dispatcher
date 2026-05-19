@@ -71,7 +71,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      # v9 installs golangci-lint v2.x (built with Go 1.26+). The
+      # `.golangci.yml` at repo root configures errcheck to skip the
+      # fire-and-forget ResponseWriter.Write / Fprint / Closer.Close
+      # patterns v2 catches but v1 didn't.
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: latest
 

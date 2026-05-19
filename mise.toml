@@ -4,5 +4,7 @@
 
 [tools]
 go = "1.24"
-golangci-lint = "1"
+# v2.x supports the v2-format .golangci.yml and is what CI installs
+# via golangci-lint-action@v9. Local lint matches CI lint.
+golangci-lint = "2"
 lefthook = "1"

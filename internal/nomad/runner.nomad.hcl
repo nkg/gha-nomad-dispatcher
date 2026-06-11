@@ -1,7 +1,11 @@
 job "@@JOB_ID@@" {
   type        = "batch"
   namespace   = "@@NAMESPACE@@"
-  datacenters = ["dc1"]
+  # Wildcard: schedule on any client in the cluster regardless of the
+  # datacenter name (fleets name their DC whatever they like, e.g.
+  # "sproncy-lab"). Add a constraint here if a tenant ever needs to
+  # pin jobs to a specific site.
+  datacenters = ["*"]
 
   # Ephemeral: no restart, no reschedule. A failed runner job means
   # the GHA job failed; rescheduling would just queue another runner

@@ -1,9 +1,12 @@
 // gha-nomad-dispatcher receives GitHub workflow_job webhooks and
 // submits Nomad jobs that spawn ephemeral runner containers.
 //
-// v0.1 scope: single-tenant. One GitHub webhook secret, one
-// token-server, one Nomad cluster, one runner image. Per-org / per-
-// repo routing comes in a follow-up.
+// v0.2 scope: multi-tenant. One dispatcher serves many owners (orgs
+// and personal user accounts). Each owner is its own GitHub App with
+// its own webhook secret, selected by the /webhook/{owner} path; the
+// dispatcher mints registration tokens itself (org-scoped for orgs,
+// repo-scoped for user accounts) and submits into the owner's Nomad
+// namespace with the owner's labels.
 package main
 
 import (
@@ -15,12 +18,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/nkg/gha-nomad-dispatcher/internal/config"
+	"github.com/nkg/gha-nomad-dispatcher/internal/github"
 	"github.com/nkg/gha-nomad-dispatcher/internal/nomad"
-	"github.com/nkg/gha-nomad-dispatcher/internal/tokenserver"
 	"github.com/nkg/gha-nomad-dispatcher/internal/webhook"
 )
 
@@ -37,14 +41,17 @@ func main() {
 	}
 
 	srv := &server{
-		cfg:    cfg,
-		tokens: tokenserver.New(cfg.TokenServerURL),
-		nomad:  nomad.New(cfg.NomadAddr, cfg.NomadToken),
-		log:    logger,
+		cfg:   cfg,
+		mint:  github.NewMinter(cfg.Tenants),
+		nomad: nomad.New(cfg.NomadAddr, cfg.NomadToken),
+		log:   logger,
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /webhook", srv.handleWebhook)
+	// Per-owner path: the path segment selects which owner's webhook
+	// secret validates the delivery — chosen before the body is parsed,
+	// since each owner's GitHub App signs with its own secret.
+	mux.HandleFunc("POST /webhook/{owner}", srv.handleWebhook)
 	mux.HandleFunc("GET /healthz", srv.handleHealth)
 
 	httpSrv := &http.Server{
@@ -53,13 +60,11 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	// Graceful shutdown on SIGINT/SIGTERM. Webhook deliveries
-	// in-flight are given 30s to finish before the process exits.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		logger.Info("listening", "addr", cfg.ListenAddr)
+		logger.Info("listening", "addr", cfg.ListenAddr, "owners", len(cfg.Owners))
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("server error", "err", err)
 			stop()
@@ -79,10 +84,10 @@ func main() {
 }
 
 type server struct {
-	cfg    config.Config
-	tokens *tokenserver.Client
-	nomad  *nomad.Client
-	log    *slog.Logger
+	cfg   config.Config
+	mint  *github.Minter
+	nomad *nomad.Client
+	log   *slog.Logger
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -90,16 +95,24 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-// handleWebhook ingests a single GitHub webhook delivery, validates
-// its signature, and (if it's a queued workflow_job) submits a
-// Nomad job to spawn an ephemeral runner for it.
+// handleWebhook ingests a single GitHub webhook delivery for the owner
+// named in the path, validates its signature against that owner's
+// secret, and (if it's a queued workflow_job) submits a Nomad job to
+// spawn an ephemeral runner.
 //
-// Returns 202 Accepted on successful dispatch; 204 No Content for
-// events we deliberately ignore (non-queued actions, other event
-// types); 4xx for malformed deliveries; 5xx for downstream failures.
+// 202 on dispatch; 204 for deliveries we ignore; 4xx for malformed or
+// misrouted deliveries; 5xx for downstream failures.
 func (s *server) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	ownerParam := strings.ToLower(r.PathValue("owner"))
 	delivery := r.Header.Get(webhook.HeaderDelivery)
-	log := s.log.With("delivery", delivery)
+	log := s.log.With("delivery", delivery, "owner", ownerParam)
+
+	owner, ok := s.cfg.Owners[ownerParam]
+	if !ok {
+		log.Warn("unknown owner in path")
+		http.Error(w, "unknown owner", http.StatusNotFound)
+		return
+	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20)) // 1 MiB cap
 	if err != nil {
@@ -109,7 +122,7 @@ func (s *server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sig := r.Header.Get(webhook.HeaderSignature)
-	if !webhook.ValidateSignature(sig, body, s.cfg.WebhookSecret) {
+	if !webhook.ValidateSignature(sig, body, owner.WebhookSecret) {
 		log.Warn("signature invalid")
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
@@ -117,8 +130,6 @@ func (s *server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	event := r.Header.Get(webhook.HeaderEvent)
 	if event != "workflow_job" {
-		// Other event types are valid deliveries but not interesting
-		// to the dispatcher — ack and move on.
 		log.Debug("ignoring event", "event", event)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -131,13 +142,23 @@ func (s *server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Defence in depth: the validated body must belong to the owner the
+	// path (and thus the secret) claimed. A mismatch means a delivery
+	// was routed to the wrong owner path — refuse rather than dispatch
+	// it under the wrong tenant.
+	if strings.ToLower(ev.OwnerLogin()) != ownerParam {
+		log.Warn("payload owner does not match path", "payload_owner", ev.OwnerLogin())
+		http.Error(w, "owner mismatch", http.StatusBadRequest)
+		return
+	}
+
 	if !ev.IsQueued() {
 		log.Debug("ignoring non-queued action", "action", ev.Action)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	if err := s.dispatch(r.Context(), log, ev); err != nil {
+	if err := s.dispatch(r.Context(), log, owner, ev); err != nil {
 		log.Error("dispatch failed", "err", err)
 		http.Error(w, "dispatch failed", http.StatusInternalServerError)
 		return
@@ -145,26 +166,31 @@ func (s *server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// dispatch handles the happy path: mint a registration token, render
-// the Nomad job HCL, submit it. Returns nil on success.
-func (s *server) dispatch(ctx context.Context, log *slog.Logger, ev *webhook.WorkflowJob) error {
-	org := ev.Repository.Owner.Login
+// dispatch mints a registration token for the owner, renders the Nomad
+// job HCL, and submits it. Org owners get an org-level runner; user
+// owners get a repo-scoped one (they have no account-level runner pool).
+func (s *server) dispatch(ctx context.Context, log *slog.Logger, owner *config.Owner, ev *webhook.WorkflowJob) error {
 	log = log.With("repo", ev.Repository.FullName, "job_id", ev.WorkflowJob.ID)
 
-	tok, err := s.tokens.MintRegistrationToken(ctx, org)
+	tok, err := s.mint.RegistrationToken(ctx, owner.Login, ev.RepoName(), owner.RepoScoped)
 	if err != nil {
 		return fmt.Errorf("mint token: %w", err)
 	}
 
+	runnerURL := "https://github.com/" + ev.Repository.Owner.Login
+	if owner.RepoScoped {
+		runnerURL = "https://github.com/" + ev.Repository.FullName
+	}
+
 	hcl, err := nomad.Render(nomad.RunnerJobInputs{
-		JobID:        fmt.Sprintf("gha-runner-%d", ev.WorkflowJob.ID),
-		Namespace:    s.cfg.NomadNamespace,
-		RunnerURL:    fmt.Sprintf("https://github.com/%s", ev.Repository.FullName),
-		RunnerToken:  tok.Token,
-		RunnerLabels: s.cfg.RunnerLabels,
-		RunnerImage:  s.cfg.RunnerImage,
-		CPU:          s.cfg.RunnerCPU,
-		Memory:       s.cfg.RunnerMemory,
+		JobID:        fmt.Sprintf("gha-runner-%s-%d", owner.Login, ev.WorkflowJob.ID),
+		Namespace:    owner.NomadNamespace,
+		RunnerURL:    runnerURL,
+		RunnerToken:  tok,
+		RunnerLabels: owner.RunnerLabels,
+		RunnerImage:  owner.RunnerImage,
+		CPU:          s.cfg.DefaultCPU,
+		Memory:       s.cfg.DefaultMemory,
 	})
 	if err != nil {
 		return fmt.Errorf("render job: %w", err)
@@ -174,6 +200,6 @@ func (s *server) dispatch(ctx context.Context, log *slog.Logger, ev *webhook.Wor
 	if err != nil {
 		return fmt.Errorf("submit job: %w", err)
 	}
-	log.Info("runner dispatched", "eval_id", evalID)
+	log.Info("runner dispatched", "eval_id", evalID, "namespace", owner.NomadNamespace, "repo_scoped", owner.RepoScoped)
 	return nil
 }

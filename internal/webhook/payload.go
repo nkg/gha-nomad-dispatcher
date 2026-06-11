@@ -26,6 +26,12 @@ type WorkflowJob struct {
 		FullName string `json:"full_name"` // "owner/repo"
 		Owner    struct {
 			Login string `json:"login"`
+			// Type is GitHub's account type for the repo owner:
+			// "Organization" or "User". It decides where a runner
+			// registers — orgs get an org-level registration token,
+			// user accounts have no account-level runner pool so they
+			// register per-repo. See OwnerType / IsUserOwner.
+			Type string `json:"type"`
 		} `json:"owner"`
 		Name string `json:"name"`
 	} `json:"repository"`
@@ -51,4 +57,28 @@ func ParseWorkflowJob(body []byte) (*WorkflowJob, error) {
 // runner-job lifecycle from there.
 func (e *WorkflowJob) IsQueued() bool {
 	return e.Action == "queued"
+}
+
+// OwnerLogin is the repo owner's login (the routing key — present on
+// both org- and user-owned payloads, where the top-level
+// `organization` object is not).
+func (e *WorkflowJob) OwnerLogin() string {
+	return e.Repository.Owner.Login
+}
+
+// RepoName is the bare repository name (without the owner prefix),
+// needed to scope a registration token for user-owned repos.
+func (e *WorkflowJob) RepoName() string {
+	return e.Repository.Name
+}
+
+// IsUserOwner reports whether the repo is owned by a personal user
+// account rather than an organisation. GitHub only exposes
+// account-level self-hosted runner pools for orgs and enterprises, so
+// user-owned repos must register runners at repo scope. Anything that
+// isn't explicitly "Organization" is treated as a user account (the
+// conservative default — repo-scoped registration also works for
+// orgs, it's just narrower).
+func (e *WorkflowJob) IsUserOwner() bool {
+	return e.Repository.Owner.Type != "Organization"
 }

@@ -14,9 +14,20 @@ const queuedPayload = `{
   "repository": {
     "full_name": "owner/repo",
     "name": "repo",
-    "owner": { "login": "owner" }
+    "owner": { "login": "owner", "type": "Organization" }
   },
   "installation": { "id": 999 }
+}`
+
+const userOwnedPayload = `{
+  "action": "queued",
+  "workflow_job": { "id": 222, "status": "queued" },
+  "repository": {
+    "full_name": "nkg/private-thing",
+    "name": "private-thing",
+    "owner": { "login": "nkg", "type": "User" }
+  },
+  "installation": { "id": 1000 }
 }`
 
 const completedPayload = `{
@@ -41,6 +52,25 @@ func TestParseWorkflowJob(t *testing.T) {
 	}
 	if ev.Repository.Owner.Login != "owner" {
 		t.Errorf("Repository.Owner.Login = %q", ev.Repository.Owner.Login)
+	}
+	if ev.IsUserOwner() {
+		t.Errorf("org-owned payload IsUserOwner() = true")
+	}
+}
+
+func TestIsUserOwner(t *testing.T) {
+	user, err := ParseWorkflowJob([]byte(userOwnedPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !user.IsUserOwner() {
+		t.Errorf("user-owned payload IsUserOwner() = false")
+	}
+	if got := user.OwnerLogin(); got != "nkg" {
+		t.Errorf("OwnerLogin() = %q, want nkg", got)
+	}
+	if got := user.RepoName(); got != "private-thing" {
+		t.Errorf("RepoName() = %q, want private-thing", got)
 	}
 }
 

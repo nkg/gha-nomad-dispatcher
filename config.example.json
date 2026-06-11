@@ -1,0 +1,31 @@
+{
+  "listen_addr": ":8080",
+  "nomad_addr": "http://nomad-server.lab:4646",
+  "nomad_token": "",
+  "defaults": {
+    "runner_image": "ghcr.io/nkg/oci-actions-runner:v0.1.0",
+    "runner_cpu_mhz": 2000,
+    "runner_memory_mb": 2048
+  },
+  "owners": [
+    {
+      "login": "sproncy",
+      "type": "organization",
+      "app_id": "2879772",
+      "installation_id": 110552520,
+      "private_key_path": "/etc/gha-dispatcher/keys/sproncy.pem",
+      "webhook_secret": "REPLACE_WITH_SPRONCY_WEBHOOK_SECRET",
+      "runner_labels": "self-hosted,linux,x64,podman,sproncy",
+      "nomad_namespace": "sproncy"
+    },
+    {
+      "login": "nkg",
+      "type": "user",
+      "app_id": "Iv23liREPLACE",
+      "installation_id": 99887766,
+      "private_key_path": "/etc/gha-dispatcher/keys/nkg.pem",
+      "webhook_secret": "REPLACE_WITH_NKG_WEBHOOK_SECRET",
+      "runner_labels": "self-hosted,linux,x64,podman,nkg"
+    }
+  ]
+}

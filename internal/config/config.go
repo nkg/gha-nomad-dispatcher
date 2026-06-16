@@ -50,10 +50,10 @@ type Owner struct {
 
 // Config is the resolved runtime configuration.
 type Config struct {
-	ListenAddr   string
-	NomadAddr    string
-	NomadToken   string
-	DefaultCPU   int // MHz
+	ListenAddr    string
+	NomadAddr     string
+	NomadToken    string
+	DefaultCPU    int // MHz
 	DefaultMemory int // MB
 
 	// Owners is keyed by lowercased login.
@@ -66,11 +66,11 @@ type Config struct {
 // ── on-disk schema ──────────────────────────────────────────────────
 
 type fileConfig struct {
-	ListenAddr string         `json:"listen_addr"`
-	NomadAddr  string         `json:"nomad_addr"`
-	NomadToken string         `json:"nomad_token"`
-	Defaults   fileDefaults   `json:"defaults"`
-	Owners     []fileOwner    `json:"owners"`
+	ListenAddr string       `json:"listen_addr"`
+	NomadAddr  string       `json:"nomad_addr"`
+	NomadToken string       `json:"nomad_token"`
+	Defaults   fileDefaults `json:"defaults"`
+	Owners     []fileOwner  `json:"owners"`
 }
 
 type fileDefaults struct {

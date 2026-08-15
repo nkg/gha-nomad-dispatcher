@@ -4,7 +4,11 @@
 
 [tools]
 go = "1.26"
-# v2.x supports the v2-format .golangci.yml and is what CI installs
-# via golangci-lint-action@v9. Local lint matches CI lint.
+# v2.x supports the v2-format .golangci.yml. CI runs golangci-lint
+# through the shared nkg/github-actions go.yml reusable, which reads
+# this file — so local lint and CI lint are the same version.
 golangci-lint = "2"
-lefthook = "1"
+# v2. The hook globs use the "{,**/}*" form, which matches root-level
+# files under both v1 and v2; pinning v2 keeps local behaviour
+# matching the binary most machines here already have installed.
+lefthook = "2"

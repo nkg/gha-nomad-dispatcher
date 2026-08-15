@@ -5,7 +5,9 @@ WORKDIR /build
 COPY go.mod go.sum* ./
 RUN go mod download
 
-COPY main.go ./
+# All root-package sources, not just main.go — the package is more
+# than one file and a missed COPY only shows up as a build failure.
+COPY *.go ./
 COPY internal/ ./internal/
 
 # Static, position-independent, stripped + reproducible.
@@ -14,7 +16,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o gha-nomad-dispatcher .
 
 # ─── Runtime ──────────────────────────────────────────────────
-FROM alpine:3.22
+FROM alpine:3.24
 
 LABEL org.opencontainers.image.title="gha-nomad-dispatcher"
 LABEL org.opencontainers.image.description="GitHub workflow_job webhook → Nomad job dispatcher"

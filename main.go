@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,12 +41,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := &server{
-		cfg:   cfg,
-		mint:  github.NewMinter(cfg.Tenants),
-		nomad: nomad.New(cfg.NomadAddr, cfg.NomadToken),
-		log:   logger,
-	}
+	srv := newServer(cfg, github.NewMinter(cfg.Tenants), nomad.New(cfg.NomadAddr, cfg.NomadToken), logger)
 
 	mux := http.NewServeMux()
 	// Per-owner path: the path segment selects which owner's webhook
@@ -80,14 +76,72 @@ func main() {
 		logger.Error("graceful shutdown failed", "err", err)
 		os.Exit(1)
 	}
+
+	// Dispatches run in the background now, so the HTTP server going
+	// quiet doesn't mean the work is done. Wait for in-flight mints
+	// and job submissions rather than killing them half-way.
+	logger.Info("draining in-flight dispatches")
+	if !srv.drain(drainTimeout) {
+		logger.Warn("gave up waiting for in-flight dispatches", "timeout", drainTimeout)
+	}
 	logger.Info("bye")
 }
+
+const (
+	// dispatchTimeout bounds one background dispatch (mint + submit).
+	// Generous: a cold token cache costs two GitHub round trips, each
+	// with a retry, before Nomad is contacted at all.
+	dispatchTimeout = 90 * time.Second
+
+	// dedupeCapacity is how many recently-dispatched workflow_job IDs
+	// are remembered. Sized well above any plausible in-flight queue
+	// depth for a homelab fleet; the whole structure is two small
+	// allocations.
+	dedupeCapacity = 4096
+
+	// drainTimeout bounds how long shutdown waits for in-flight
+	// background dispatches before giving up on them.
+	drainTimeout = 30 * time.Second
+)
 
 type server struct {
 	cfg   config.Config
 	mint  *github.Minter
 	nomad *nomad.Client
 	log   *slog.Logger
+
+	// inflight tracks background dispatches so shutdown can drain
+	// them rather than killing a half-submitted runner.
+	inflight sync.WaitGroup
+
+	// seen suppresses duplicate dispatches for a redelivered webhook.
+	seen *dedupe
+}
+
+func newServer(cfg config.Config, mint *github.Minter, nc *nomad.Client, log *slog.Logger) *server {
+	return &server{
+		cfg:   cfg,
+		mint:  mint,
+		nomad: nc,
+		log:   log,
+		seen:  newDedupe(dedupeCapacity),
+	}
+}
+
+// drain waits for in-flight dispatches to finish, or for timeout.
+// Returns false if it gave up waiting.
+func (s *server) drain(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		s.inflight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -158,11 +212,52 @@ func (s *server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.dispatch(r.Context(), log, owner, ev); err != nil {
-		log.Error("dispatch failed", "err", err)
-		http.Error(w, "dispatch failed", http.StatusInternalServerError)
+	// The config decides registration scope, but the payload carries
+	// GitHub's own view of the owner type. A disagreement means the
+	// config is wrong and tokens are being minted at the wrong scope,
+	// which shows up as a confusing 404 from the GitHub API — so say
+	// so plainly rather than leaving it to be inferred from the error.
+	if ev.IsUserOwner() != owner.RepoScoped {
+		log.Warn("configured owner type disagrees with webhook payload",
+			"configured_repo_scoped", owner.RepoScoped,
+			"payload_owner_type", ev.Repository.Owner.Type)
+	}
+
+	// Claim the job before acknowledging. GitHub redelivers when the
+	// endpoint doesn't answer inside its delivery timeout, and a
+	// redelivery that raced ahead of this claim would spawn a second
+	// runner for the same job.
+	if !s.seen.claim(ev.WorkflowJob.ID) {
+		log.Info("duplicate delivery for already-dispatched job, ignoring",
+			"job_id", ev.WorkflowJob.ID)
+		w.WriteHeader(http.StatusOK)
 		return
 	}
+
+	// Acknowledge now, dispatch in the background. Minting a token
+	// costs up to two GitHub round trips (each with a retry) before
+	// Nomad is contacted, which can outrun the ~10s GitHub allows a
+	// webhook endpoint — and a slow-but-successful dispatch that gets
+	// redelivered is exactly how you end up with two runners on one
+	// job.
+	s.inflight.Add(1)
+	go func() {
+		defer s.inflight.Done()
+
+		// Not r.Context(): that is cancelled the moment this handler
+		// returns, which is immediately.
+		ctx, cancel := context.WithTimeout(context.Background(), dispatchTimeout)
+		defer cancel()
+
+		if err := s.dispatch(ctx, log, owner, ev); err != nil {
+			log.Error("dispatch failed", "err", err)
+			// Drop the claim so GitHub's redelivery — the only retry
+			// mechanism there is, now that the response is already
+			// sent — is allowed through.
+			s.seen.release(ev.WorkflowJob.ID)
+		}
+	}()
+
 	w.WriteHeader(http.StatusAccepted)
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nkg/gha-nomad-dispatcher/internal/config"
 	"github.com/nkg/gha-nomad-dispatcher/internal/github"
@@ -22,23 +23,26 @@ import (
 // render, job submit) are covered in their own packages.
 
 func testServer(secret string) *server {
-	return &server{
-		cfg: config.Config{
-			Owners: map[string]*config.Owner{
-				"sproncy": {
-					Login:          "sproncy",
-					RepoScoped:     false,
-					WebhookSecret:  secret,
-					RunnerLabels:   "self-hosted,sproncy",
-					RunnerImage:    "img",
-					NomadNamespace: "sproncy",
-				},
+	cfg := config.Config{
+		Owners: map[string]*config.Owner{
+			"sproncy": {
+				Login:          "sproncy",
+				RepoScoped:     false,
+				WebhookSecret:  secret,
+				RunnerLabels:   "self-hosted,sproncy",
+				RunnerImage:    "img",
+				NomadNamespace: "sproncy",
 			},
 		},
-		mint:  github.NewMinter(map[string]*github.Tenant{}),
-		nomad: nomad.New("http://127.0.0.1:1", ""),
-		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
+	// No tenants configured, so any dispatch that does start fails
+	// immediately at the mint step — which is what these tests want.
+	return newServer(
+		cfg,
+		github.NewMinter(map[string]*github.Tenant{}),
+		nomad.New("http://127.0.0.1:1", ""),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
 }
 
 func sign(secret string, body []byte) string {
@@ -112,5 +116,43 @@ func TestHandleWebhook_IgnoresNonQueued(t *testing.T) {
 	rec := post(t, srv, "sproncy", "workflow_job", sign("s3cr3t", []byte(body)), body)
 	if rec.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want 204", rec.Code)
+	}
+}
+
+// A queued job is acknowledged immediately; the dispatch itself runs
+// in the background, so the response must not wait on the mint +
+// Nomad submit round trips.
+func TestHandleWebhook_QueuedAcknowledgedImmediately(t *testing.T) {
+	srv := testServer("s3cr3t")
+	body := queuedSproncy
+	rec := post(t, srv, "sproncy", "workflow_job", sign("s3cr3t", []byte(body)), body)
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want 202", rec.Code)
+	}
+	if !srv.drain(5 * time.Second) {
+		t.Error("background dispatch did not finish")
+	}
+}
+
+// GitHub redelivers when the endpoint is slow. A redelivery for a job
+// already claimed must be acknowledged without dispatching a second
+// runner.
+func TestHandleWebhook_DuplicateDeliveryIgnored(t *testing.T) {
+	srv := testServer("s3cr3t")
+
+	// queuedSproncy carries workflow_job.id == 1. Claim it up front so
+	// the handler sees an already-dispatched job deterministically,
+	// without racing a background dispatch.
+	if !srv.seen.claim(1) {
+		t.Fatal("precondition: claim on a fresh dedupe should succeed")
+	}
+
+	body := queuedSproncy
+	rec := post(t, srv, "sproncy", "workflow_job", sign("s3cr3t", []byte(body)), body)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (duplicate acknowledged, not dispatched)", rec.Code)
+	}
+	if !srv.drain(time.Second) {
+		t.Error("duplicate delivery started a dispatch, but should not have")
 	}
 }

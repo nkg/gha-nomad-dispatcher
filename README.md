@@ -106,7 +106,7 @@ tokens; orgs need org self-hosted-runner write.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/webhook/{owner}` | GitHub webhook ingestion for one owner. `202` on dispatch, `204` on ignored event/action, `401` on signature failure, `400` on malformed payload or owner mismatch, `404` on unknown owner, `500` on downstream failure. |
+| `POST` | `/webhook/{owner}` | GitHub webhook ingestion for one owner. `202` when the job is accepted for dispatch, `200` when it's a duplicate delivery for a job already dispatched, `204` on ignored event/action, `401` on signature failure, `400` on malformed payload or owner mismatch, `404` on unknown owner. |
 | `GET` | `/healthz` | Liveness probe. |
 
 ## Build + run
@@ -154,14 +154,51 @@ and the App private keys live in exactly one place. `gha-token-server`
 remains a standalone service for non-Nomad consumers; it is no longer
 on this dispatcher's path.
 
+### Dispatch is asynchronous, and de-duplicated
+
+`202` means *accepted*, not *dispatched*. The handler validates the
+delivery, claims the job, acknowledges, and does the mint + Nomad
+submit on a background goroutine.
+
+That's not cosmetic. GitHub allows a webhook endpoint roughly ten
+seconds before it marks the delivery failed and redelivers. Minting a
+registration token on a cold cache costs two GitHub API round trips,
+each with a retry, before Nomad is contacted at all — comfortably able
+to outrun that budget. Answering synchronously meant a slow-but-
+successful dispatch got redelivered, and the redelivery submitted a
+*second* Nomad job for the same workflow job. Two runners, one job,
+one of them idle until it times out.
+
+So each `workflow_job.id` is claimed before the acknowledgement, and a
+redelivery for a job already claimed gets a `200` and does nothing.
+The claim is dropped if the dispatch fails, because GitHub's
+redelivery is the only retry mechanism left once the response has
+already gone out. Claims are held in a bounded FIFO (4096 entries);
+past that the oldest are evicted, which degrades to exactly the old
+behaviour rather than growing without limit.
+
+Because the work now outlives the request, shutdown drains in-flight
+dispatches (30s cap) after the HTTP server stops accepting.
+
 ### Owner type decides registration scope
 
 GitHub only exposes account-level self-hosted runner pools for
 organisations (and enterprises). Personal user accounts don't have
-one, so a user-owned repo's runner must register at repo scope. The
-dispatcher reads `repository.owner.type` and picks the GitHub API
-endpoint accordingly: `POST /orgs/{owner}/…/registration-token` vs
-`POST /repos/{owner}/{repo}/…/registration-token`.
+one, so a user-owned repo's runner must register at repo scope. That
+picks the GitHub API endpoint: `POST /orgs/{owner}/…/registration-token`
+vs `POST /repos/{owner}/{repo}/…/registration-token`.
+
+The scope comes from the **config file**, not the webhook payload —
+each owner's `"type": "organization" | "user"` sets it. Config is
+authoritative because it's also what decides the Nomad namespace and
+labels, and having one source of truth for a tenant's shape beats
+having two that can disagree.
+
+The payload's `repository.owner.type` is still read, as a
+cross-check: if GitHub's view disagrees with the configured type the
+dispatcher logs a `configured owner type disagrees with webhook
+payload` warning. Without it, a mistyped owner surfaces only as an
+opaque 404 from the GitHub API at mint time.
 
 ### No `hashicorp/nomad/api` dependency
 

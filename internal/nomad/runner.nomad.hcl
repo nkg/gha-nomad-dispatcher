@@ -43,6 +43,11 @@ job "@@JOB_ID@@" {
         RUNNER_TOKEN     = "@@RUNNER_TOKEN@@"
         RUNNER_LABELS    = "@@RUNNER_LABELS@@"
         RUNNER_EPHEMERAL = "true"
+        # Seconds to wait for a FIRST job before exiting. The runner
+        # image arms a watchdog on this; an image that does not know the
+        # variable ignores it, so an older image keeps the previous
+        # behaviour rather than breaking.
+        RUNNER_IDLE_TIMEOUT = "@@IDLE_TIMEOUT@@"
         # The runner image is expected to honour these env vars in
         # its entrypoint and shell out to `config.sh` + `run.sh`.
       }

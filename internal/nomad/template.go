@@ -46,6 +46,20 @@ type RunnerJobInputs struct {
 
 	// Memory is the Nomad memory resource in MB.
 	Memory int
+
+	// IdleTimeout is how many seconds a spawned runner waits for its
+	// FIRST job before exiting. 0 disables it, which is the old
+	// behaviour: wait forever.
+	//
+	// It exists because this dispatcher spawns a runner per queued
+	// workflow_job without checking labels, so a runner routinely
+	// outlives its reason for existing — the job it was created for is
+	// claimed by someone else, or wants labels it does not advertise.
+	// An --ephemeral runner exits after one job but waits indefinitely
+	// for its first, so those runners hold an allocation until
+	// something else happens to match them. On a multi-tenant cluster
+	// that is starvation, not untidiness.
+	IdleTimeout int
 }
 
 // Render substitutes the inputs into the embedded template and
@@ -69,6 +83,7 @@ func Render(in RunnerJobInputs) (string, error) {
 		"@@RUNNER_IMAGE@@":  in.RunnerImage,
 		"@@CPU@@":           fmt.Sprintf("%d", in.CPU),
 		"@@MEMORY@@":        fmt.Sprintf("%d", in.Memory),
+		"@@IDLE_TIMEOUT@@":  fmt.Sprintf("%d", in.IdleTimeout),
 	}
 	for k, v := range replacements {
 		out = strings.ReplaceAll(out, k, v)

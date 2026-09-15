@@ -50,11 +50,12 @@ type Owner struct {
 
 // Config is the resolved runtime configuration.
 type Config struct {
-	ListenAddr    string
-	NomadAddr     string
-	NomadToken    string
-	DefaultCPU    int // MHz
-	DefaultMemory int // MB
+	ListenAddr         string
+	NomadAddr          string
+	NomadToken         string
+	DefaultCPU         int // MHz
+	DefaultMemory      int // MB
+	DefaultIdleTimeout int // seconds; 0 disables
 
 	// Owners is keyed by lowercased login.
 	Owners map[string]*Owner
@@ -74,9 +75,10 @@ type fileConfig struct {
 }
 
 type fileDefaults struct {
-	RunnerImage    string `json:"runner_image"`
-	RunnerCPUMHz   int    `json:"runner_cpu_mhz"`
-	RunnerMemoryMB int    `json:"runner_memory_mb"`
+	RunnerImage       string `json:"runner_image"`
+	RunnerCPUMHz      int    `json:"runner_cpu_mhz"`
+	RunnerMemoryMB    int    `json:"runner_memory_mb"`
+	RunnerIdleTimeout int    `json:"runner_idle_timeout"`
 }
 
 type fileOwner struct {
@@ -119,8 +121,14 @@ func parse(data []byte) (Config, error) {
 		NomadToken:    fc.NomadToken,
 		DefaultCPU:    orDefaultInt(fc.Defaults.RunnerCPUMHz, 2000),
 		DefaultMemory: orDefaultInt(fc.Defaults.RunnerMemoryMB, 2048),
-		Owners:        map[string]*Owner{},
-		Tenants:       map[string]*github.Tenant{},
+		// 900s. Long enough that a runner which merely lost a race for
+		// its job is still picked up by the next matching one — the
+		// common case, and cheaper than respawning. Short enough that a
+		// runner spawned for labels it can never serve frees its slot
+		// within the quarter hour rather than after eighteen.
+		DefaultIdleTimeout: orDefaultInt(fc.Defaults.RunnerIdleTimeout, 900),
+		Owners:             map[string]*Owner{},
+		Tenants:            map[string]*github.Tenant{},
 	}
 
 	if cfg.NomadAddr == "" {

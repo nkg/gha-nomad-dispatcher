@@ -280,7 +280,8 @@ func (s *server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// dispatch mints a registration token for the owner, renders the Nomad
+// dispatch mints a registration token (and, best-effort, a removal
+// token) for the owner, renders the Nomad
 // job HCL, and submits it. Org owners get an org-level runner; user
 // owners get a repo-scoped one (they have no account-level runner pool).
 func (s *server) dispatch(ctx context.Context, log *slog.Logger, owner *config.Owner, ev *webhook.WorkflowJob) error {
@@ -289,6 +290,17 @@ func (s *server) dispatch(ctx context.Context, log *slog.Logger, owner *config.O
 	tok, err := s.mint.RegistrationToken(ctx, owner.Login, ev.RepoName(), owner.RepoScoped)
 	if err != nil {
 		return fmt.Errorf("mint token: %w", err)
+	}
+
+	// Best-effort, deliberately. A removal token only buys cleanliness
+	// — the runner registers, works and exits without it — so failing
+	// the dispatch over one would trade a working job for a tidy runner
+	// list. Warn and carry on; the consequence is the offline
+	// registration this is meant to prevent, not a lost job.
+	removeTok, err := s.mint.RemovalToken(ctx, owner.Login, ev.RepoName(), owner.RepoScoped)
+	if err != nil {
+		log.Warn("could not mint a removal token; this runner will not deregister itself", "err", err)
+		removeTok = ""
 	}
 
 	runnerURL := "https://github.com/" + ev.Repository.Owner.Login
@@ -301,6 +313,7 @@ func (s *server) dispatch(ctx context.Context, log *slog.Logger, owner *config.O
 		Namespace:    owner.NomadNamespace,
 		RunnerURL:    runnerURL,
 		RunnerToken:  tok,
+		RemoveToken:  removeTok,
 		RunnerLabels: owner.RunnerLabels,
 		RunnerImage:  owner.RunnerImage,
 		CPU:          s.cfg.DefaultCPU,

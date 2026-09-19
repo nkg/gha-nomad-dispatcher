@@ -48,6 +48,13 @@ job "@@JOB_ID@@" {
         # variable ignores it, so an older image keeps the previous
         # behaviour rather than breaking.
         RUNNER_IDLE_TIMEOUT = "@@IDLE_TIMEOUT@@"
+        # Lets the runner deregister itself on shutdown. Without it a
+        # runner stopped before claiming a job — which is exactly what
+        # the idle timeout above produces — leaves an offline
+        # registration behind. A different credential from
+        # RUNNER_TOKEN: that one is single-use and spent by config.sh
+        # at startup, so `config.sh remove` cannot reuse it.
+        RUNNER_REMOVE_TOKEN = "@@REMOVE_TOKEN@@"
         # The runner image is expected to honour these env vars in
         # its entrypoint and shell out to `config.sh` + `run.sh`.
       }

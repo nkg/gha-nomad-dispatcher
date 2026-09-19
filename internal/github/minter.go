@@ -67,6 +67,16 @@ func NewMinter(tenants map[string]*Tenant) *Minter {
 	}
 }
 
+// NewMinterWithBaseURL is NewMinter against a different GitHub API
+// root. It exists so callers outside this package — the dispatch tests
+// in particular — can point a Minter at an httptest server; production
+// code should use NewMinter.
+func NewMinterWithBaseURL(tenants map[string]*Tenant, baseURL string) *Minter {
+	m := NewMinter(tenants)
+	m.baseURL = strings.TrimSuffix(baseURL, "/")
+	return m
+}
+
 // RegistrationToken mints a single-use runner registration token for
 // the owner identified by login. When repoScoped is true the token is
 // scoped to owner/repo (required for user-owned accounts); otherwise
@@ -76,6 +86,32 @@ func NewMinter(tenants map[string]*Tenant) *Minter {
 // invalidated and the exchange is retried once with a fresh one — the
 // token may have been revoked out-of-band (e.g. App key rotation).
 func (m *Minter) RegistrationToken(ctx context.Context, login, repo string, repoScoped bool) (string, error) {
+	return m.token(ctx, endpointRegistration, login, repo, repoScoped)
+}
+
+// RemovalToken mints a single-use token for `config.sh remove`, which a
+// runner needs to deregister itself.
+//
+// It is a DIFFERENT credential from the registration token, and the
+// registration token cannot stand in for it: that one is single-use and
+// already spent by `config.sh` at startup. Without a removal token a
+// runner stopped before it claims a job — which is what the image's
+// idle watchdog does — leaves an offline registration behind for GitHub
+// to garbage-collect on its own schedule. Measured on the sproncy org,
+// 2026-09-18: 90 offline registrations against 0 online.
+//
+// Same scope rules and the same auth-retry as RegistrationToken, and
+// the same App permission (`organization_self_hosted_runners: write`),
+// so an installation that can mint one can already mint the other.
+func (m *Minter) RemovalToken(ctx context.Context, login, repo string, repoScoped bool) (string, error) {
+	return m.token(ctx, endpointRemoval, login, repo, repoScoped)
+}
+
+// token runs the installation-token → runner-token exchange for either
+// endpoint, retrying once on 401/403 with a fresh installation token —
+// the cached one may have been revoked out-of-band (e.g. App key
+// rotation).
+func (m *Minter) token(ctx context.Context, kind tokenKind, login, repo string, repoScoped bool) (string, error) {
 	login = strings.ToLower(login)
 	tenant, ok := m.tenants[login]
 	if !ok {
@@ -87,24 +123,33 @@ func (m *Minter) RegistrationToken(ctx context.Context, login, repo string, repo
 		return "", fmt.Errorf("installation token: %w", err)
 	}
 
-	tok, err := m.runnerToken(ctx, installToken, login, repo, repoScoped)
+	tok, err := m.runnerToken(ctx, installToken, login, repo, repoScoped, kind)
 	if err != nil {
 		if isAuthError(err) {
-			slog.Warn("registration token failed with auth error; refreshing installation token",
-				"owner", login, "err", err)
+			slog.Warn("runner token failed with auth error; refreshing installation token",
+				"owner", login, "kind", string(kind), "err", err)
 			m.cache.invalidate(login)
 			installToken, err = m.installationToken(ctx, tenant)
 			if err != nil {
 				return "", fmt.Errorf("installation token (retry): %w", err)
 			}
-			tok, err = m.runnerToken(ctx, installToken, login, repo, repoScoped)
+			tok, err = m.runnerToken(ctx, installToken, login, repo, repoScoped, kind)
 		}
 		if err != nil {
-			return "", fmt.Errorf("registration token: %w", err)
+			return "", fmt.Errorf("%s: %w", kind, err)
 		}
 	}
 	return tok, nil
 }
+
+// tokenKind names the runner-token endpoint to call. Its value is the
+// last path segment, which is also how it reads in an error message.
+type tokenKind string
+
+const (
+	endpointRegistration tokenKind = "registration-token"
+	endpointRemoval      tokenKind = "remove-token"
+)
 
 // installationToken returns a cached or freshly-minted installation
 // access token for the tenant. Cache misses for the same owner coalesce
@@ -156,19 +201,20 @@ func (m *Minter) installationToken(ctx context.Context, tenant *Tenant) (string,
 	return v.(string), nil
 }
 
-// runnerToken exchanges an installation token for a runner registration
-// token. The endpoint is owner-type dependent: repo-scoped for user
-// accounts (which have no account-level runner pool), org-scoped
-// otherwise.
-func (m *Minter) runnerToken(ctx context.Context, installToken, login, repo string, repoScoped bool) (string, error) {
+// runnerToken exchanges an installation token for a runner
+// registration or removal token. The endpoint is owner-type dependent:
+// repo-scoped for user accounts (which have no account-level runner
+// pool), org-scoped otherwise. Both kinds live at the same two paths
+// and differ only in the last segment.
+func (m *Minter) runnerToken(ctx context.Context, installToken, login, repo string, repoScoped bool, kind tokenKind) (string, error) {
 	var url string
 	if repoScoped {
 		if repo == "" {
 			return "", fmt.Errorf("repo-scoped registration requires a repository name")
 		}
-		url = fmt.Sprintf("%s/repos/%s/%s/actions/runners/registration-token", m.baseURL, login, repo)
+		url = fmt.Sprintf("%s/repos/%s/%s/actions/runners/%s", m.baseURL, login, repo, kind)
 	} else {
-		url = fmt.Sprintf("%s/orgs/%s/actions/runners/registration-token", m.baseURL, login)
+		url = fmt.Sprintf("%s/orgs/%s/actions/runners/%s", m.baseURL, login, kind)
 	}
 
 	resp, body, err := m.do(ctx, http.MethodPost, url, "Bearer "+installToken)
@@ -186,10 +232,10 @@ func (m *Minter) runnerToken(ctx context.Context, installToken, login, repo stri
 		Token string `json:"token"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("parsing registration token response: %w", err)
+		return "", fmt.Errorf("parsing runner token response: %w", err)
 	}
 	if result.Token == "" {
-		return "", fmt.Errorf("GitHub returned an empty registration token")
+		return "", fmt.Errorf("GitHub returned an empty token")
 	}
 	return result.Token, nil
 }

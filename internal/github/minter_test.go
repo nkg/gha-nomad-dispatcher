@@ -50,6 +50,17 @@ func (f *fakeGitHub) handler() http.Handler {
 	}
 	mux.HandleFunc("/orgs/{org}/actions/runners/registration-token", regHandler)
 	mux.HandleFunc("/repos/{owner}/{repo}/actions/runners/registration-token", regHandler)
+
+	// Removal tokens come back with a distinct value so a test cannot
+	// pass by accidentally hitting the registration endpoint.
+	rmHandler := func(w http.ResponseWriter, r *http.Request) {
+		f.regCalls.Add(1)
+		f.lastRegPath.Store(r.URL.Path)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": "ghr_removal_token"})
+	}
+	mux.HandleFunc("/orgs/{org}/actions/runners/remove-token", rmHandler)
+	mux.HandleFunc("/repos/{owner}/{repo}/actions/runners/remove-token", rmHandler)
 	return mux
 }
 
@@ -172,5 +183,77 @@ func TestRegistrationToken_AuthRetry(t *testing.T) {
 	}
 	if n := fake.installCalls.Load(); n != 2 {
 		t.Errorf("installation calls = %d, want 2 (initial + post-invalidate)", n)
+	}
+}
+
+// A removal token is a different credential from a registration token
+// and comes from a different endpoint. Reusing the registration token
+// for `config.sh remove` always fails — it is single-use and already
+// spent by config.sh at startup — so these assert the path, not just
+// that some token came back.
+func TestRemovalToken_OrgScoped(t *testing.T) {
+	fake := &fakeGitHub{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	m := newTestMinter(t, srv.URL, "sproncy")
+	tok, err := m.RemovalToken(context.Background(), "sproncy", "anything", false)
+	if err != nil {
+		t.Fatalf("RemovalToken: %v", err)
+	}
+	if tok != "ghr_removal_token" {
+		t.Errorf("token = %q, want the removal endpoint's token", tok)
+	}
+	if got := fake.lastRegPath.Load().(string); got != "/orgs/sproncy/actions/runners/remove-token" {
+		t.Errorf("path = %q, want org-scoped remove-token", got)
+	}
+}
+
+func TestRemovalToken_RepoScopedForUser(t *testing.T) {
+	fake := &fakeGitHub{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	m := newTestMinter(t, srv.URL, "nkg")
+	tok, err := m.RemovalToken(context.Background(), "nkg", "private-thing", true)
+	if err != nil {
+		t.Fatalf("RemovalToken: %v", err)
+	}
+	if tok != "ghr_removal_token" {
+		t.Errorf("token = %q", tok)
+	}
+	if got := fake.lastRegPath.Load().(string); got != "/repos/nkg/private-thing/actions/runners/remove-token" {
+		t.Errorf("path = %q, want repo-scoped remove-token", got)
+	}
+}
+
+// The installation token is cached and shared by both endpoints, so
+// minting a registration token and then a removal token must not cost
+// a second installation-token round trip.
+func TestRemovalToken_SharesCachedInstallationToken(t *testing.T) {
+	fake := &fakeGitHub{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	m := newTestMinter(t, srv.URL, "sproncy")
+	if _, err := m.RegistrationToken(context.Background(), "sproncy", "", false); err != nil {
+		t.Fatalf("RegistrationToken: %v", err)
+	}
+	if _, err := m.RemovalToken(context.Background(), "sproncy", "", false); err != nil {
+		t.Fatalf("RemovalToken: %v", err)
+	}
+	if got := fake.installCalls.Load(); got != 1 {
+		t.Errorf("installation token requested %d times, want 1 (cache shared across endpoints)", got)
+	}
+}
+
+func TestRemovalToken_UnknownOwner(t *testing.T) {
+	fake := &fakeGitHub{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	m := newTestMinter(t, srv.URL, "sproncy")
+	if _, err := m.RemovalToken(context.Background(), "nobody", "", false); err == nil {
+		t.Error("want an error for an owner with no tenant configured")
 	}
 }

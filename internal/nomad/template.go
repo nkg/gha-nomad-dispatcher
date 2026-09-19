@@ -60,6 +60,17 @@ type RunnerJobInputs struct {
 	// something else happens to match them. On a multi-tenant cluster
 	// that is starvation, not untidiness.
 	IdleTimeout int
+
+	// RemoveToken lets a spawned runner deregister itself on shutdown.
+	// It is a different credential from RunnerToken — that one is
+	// single-use and already spent by config.sh at startup, so it
+	// cannot be reused for `config.sh remove`.
+	//
+	// Optional. Empty means the runner exits without deregistering and
+	// leaves an offline registration behind, which is the behaviour
+	// before this field existed; an older image that does not read
+	// RUNNER_REMOVE_TOKEN does the same whatever is passed.
+	RemoveToken string
 }
 
 // Render substitutes the inputs into the embedded template and
@@ -79,6 +90,7 @@ func Render(in RunnerJobInputs) (string, error) {
 		"@@NAMESPACE@@":     in.Namespace,
 		"@@RUNNER_URL@@":    in.RunnerURL,
 		"@@RUNNER_TOKEN@@":  in.RunnerToken,
+		"@@REMOVE_TOKEN@@":  in.RemoveToken,
 		"@@RUNNER_LABELS@@": in.RunnerLabels,
 		"@@RUNNER_IMAGE@@":  in.RunnerImage,
 		"@@CPU@@":           fmt.Sprintf("%d", in.CPU),

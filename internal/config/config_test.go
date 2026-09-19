@@ -150,6 +150,53 @@ func TestLoad_MissingRequiredOwnerFields(t *testing.T) {
 	}
 }
 
+// "not empty" and "contains a usable label" are different questions,
+// and only the second one matters: a runner_labels of ", ," passes the
+// required-field check and parses to an empty set, which would make
+// the dispatcher refuse every job this owner queues — silently, since
+// a skipped job just stays queued.
+func TestLoad_RejectsUnusableRunnerLabels(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := writeKey(t, dir)
+	body := fmt.Sprintf(`{
+      "nomad_addr": "http://n:4646",
+      "defaults": { "runner_image": "img" },
+      "owners": [{ "login": "x", "type": "organization", "app_id": "1",
+        "installation_id": 1, "private_key_path": %q,
+        "webhook_secret": "s", "runner_labels": " , ,, " }]
+    }`, keyPath)
+	_, err := loadJSON(t, body)
+	if err == nil || !strings.Contains(err.Error(), "no usable labels") {
+		t.Fatalf("want unusable-labels error, got %v", err)
+	}
+}
+
+// The parsed set built at load time is what CanServe uses, so a
+// configured owner must actually answer the superset question.
+func TestLoad_OwnerCanServe(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := writeKey(t, dir)
+	body := fmt.Sprintf(`{
+      "nomad_addr": "http://n:4646",
+      "defaults": { "runner_image": "img" },
+      "owners": [{ "login": "sproncy", "type": "organization", "app_id": "1",
+        "installation_id": 1, "private_key_path": %q,
+        "webhook_secret": "s",
+        "runner_labels": "self-hosted,linux,x64,podman,sproncy" }]
+    }`, keyPath)
+	cfg, err := loadJSON(t, body)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	owner := cfg.Owners["sproncy"]
+	if !owner.CanServe([]string{"self-hosted", "linux", "x64"}) {
+		t.Error("a subset of the configured labels must be servable")
+	}
+	if owner.CanServe([]string{"self-hosted", "linux", "x64", "docker"}) {
+		t.Error("a label the runners do not carry must not be servable")
+	}
+}
+
 func TestLoad_MissingNomadAddr(t *testing.T) {
 	body := `{ "defaults": { "runner_image": "img" }, "owners": [] }`
 	_, err := loadJSON(t, body)

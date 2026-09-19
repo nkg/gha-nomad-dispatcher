@@ -212,6 +212,25 @@ func (s *server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A runner that cannot claim this job is worse than no runner: it
+	// registers, holds a Nomad slot until its idle timeout, and leaves
+	// an offline registration behind. On a shared cluster with no
+	// cross-namespace fairness, enough of them starve the other tenant.
+	//
+	// Info, not Debug. Most owners have jobs on both this pool and a
+	// legacy one, so skips are routine rather than exceptional — and a
+	// job that queues forever is diagnosed by finding its skip line and
+	// comparing the two label sets printed here.
+	if !owner.CanServe(ev.WorkflowJob.Labels) {
+		log.Info("job labels cannot be served by this owner's runners, not dispatching",
+			"job_id", ev.WorkflowJob.ID,
+			"repo", ev.Repository.FullName,
+			"job_labels", ev.WorkflowJob.Labels,
+			"runner_labels", owner.RunnerLabels)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	// The config decides registration scope, but the payload carries
 	// GitHub's own view of the owner type. A disagreement means the
 	// config is wrong and tokens are being minted at the wrong scope,

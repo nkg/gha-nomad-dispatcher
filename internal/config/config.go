@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/nkg/gha-nomad-dispatcher/internal/github"
+	"github.com/nkg/gha-nomad-dispatcher/internal/labels"
 )
 
 // DefaultConfigPath is used when CONFIG_PATH is unset.
@@ -36,6 +37,11 @@ type Owner struct {
 
 	// RunnerLabels announced by spawned runners (comma-separated).
 	RunnerLabels string
+
+	// runnerLabelSet is RunnerLabels parsed once at load time, so a
+	// label string that parses to nothing is rejected there rather than
+	// silently refusing every job at dispatch time.
+	runnerLabelSet labels.Set
 
 	// RunnerImage to spawn — the owner override if set, else the global
 	// default.
@@ -183,6 +189,15 @@ func resolveOwner(fo fileOwner, defaultImage string) (*Owner, *github.Tenant, er
 	if fo.RunnerLabels == "" {
 		return nil, nil, fmt.Errorf("runner_labels is required")
 	}
+	// Non-empty as a string is not the same as non-empty as a label
+	// set: ", ,," passes the check above and parses to nothing, which
+	// would make CanServe refuse every job this owner ever queues. That
+	// failure is silent at runtime — jobs simply never get runners — so
+	// catch it at load, where it says what is wrong.
+	labelSet := labels.Parse(fo.RunnerLabels)
+	if labelSet.Len() == 0 {
+		return nil, nil, fmt.Errorf("runner_labels %q contains no usable labels", fo.RunnerLabels)
+	}
 	if fo.PrivateKeyPath == "" {
 		return nil, nil, fmt.Errorf("private_key_path is required")
 	}
@@ -216,11 +231,28 @@ func resolveOwner(fo fileOwner, defaultImage string) (*Owner, *github.Tenant, er
 		RepoScoped:     repoScoped,
 		WebhookSecret:  fo.WebhookSecret,
 		RunnerLabels:   fo.RunnerLabels,
+		runnerLabelSet: labelSet,
 		RunnerImage:    image,
 		NomadNamespace: namespace,
 		Tenant:         tenant,
 	}
 	return owner, tenant, nil
+}
+
+// CanServe reports whether a runner spawned for this owner could claim
+// a job requesting these `runs-on` labels. See package labels for the
+// rule and for why an empty request is served.
+//
+// Owners built by hand (in tests) have no parsed set, so fall back to
+// parsing RunnerLabels rather than refusing everything: a zero-value
+// set that silently means "serve nothing" is the one way this check
+// could strand every job in the fleet.
+func (o *Owner) CanServe(jobLabels []string) bool {
+	set := o.runnerLabelSet
+	if set.Len() == 0 {
+		set = labels.Parse(o.RunnerLabels)
+	}
+	return set.CanServe(jobLabels)
 }
 
 func orDefault(v, def string) string {

@@ -67,7 +67,10 @@ func post(t *testing.T, srv *server, ownerPath, event, sig, body string) *httpte
 	return rec
 }
 
-const queuedSproncy = `{"action":"queued","workflow_job":{"id":1,"status":"queued"},` +
+// Labels the testServer owner can serve, so the tests below exercise
+// the paths they name rather than stopping at the label pre-check.
+const queuedSproncy = `{"action":"queued","workflow_job":{"id":1,"status":"queued",` +
+	`"labels":["self-hosted","sproncy"]},` +
 	`"repository":{"full_name":"sproncy/app","name":"app","owner":{"login":"sproncy","type":"Organization"}}}`
 
 func TestHandleWebhook_UnknownOwner(t *testing.T) {
@@ -125,6 +128,81 @@ func TestHandleWebhook_IgnoresNonQueued(t *testing.T) {
 func TestHandleWebhook_QueuedAcknowledgedImmediately(t *testing.T) {
 	srv := testServer("s3cr3t")
 	body := queuedSproncy
+	rec := post(t, srv, "sproncy", "workflow_job", sign("s3cr3t", []byte(body)), body)
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want 202", rec.Code)
+	}
+	if !srv.drain(5 * time.Second) {
+		t.Error("background dispatch did not finish")
+	}
+}
+
+// A job whose runs-on labels this owner's runners do not carry must be
+// acknowledged and dropped, not dispatched: the runner it would spawn
+// could never claim it.
+func TestHandleWebhook_UnservableLabelsNotDispatched(t *testing.T) {
+	srv := testServer("s3cr3t")
+	// `docker` is a legacy-pool label; testServer's owner announces
+	// "self-hosted,sproncy".
+	body := `{"action":"queued","workflow_job":{"id":7,"status":"queued",` +
+		`"labels":["self-hosted","linux","x64","docker"]},` +
+		`"repository":{"full_name":"sproncy/app","name":"app","owner":{"login":"sproncy","type":"Organization"}}}`
+	rec := post(t, srv, "sproncy", "workflow_job", sign("s3cr3t", []byte(body)), body)
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want 204", rec.Code)
+	}
+	if !srv.drain(time.Second) {
+		t.Error("a job with unservable labels started a dispatch, but should not have")
+	}
+	// The skip must not consume the job's dedupe claim: if the labels
+	// are later widened, GitHub's redelivery has to be able to dispatch.
+	if !srv.seen.claim(7) {
+		t.Error("skipped job was claimed in the dedupe set; a later redelivery could not dispatch it")
+	}
+}
+
+// A GitHub-hosted job produces a workflow_job delivery indistinguishable
+// in shape from a self-hosted one. Spawning a runner for it is pure
+// waste, and before the pre-check that is exactly what happened.
+func TestHandleWebhook_GitHubHostedJobNotDispatched(t *testing.T) {
+	srv := testServer("s3cr3t")
+	body := `{"action":"queued","workflow_job":{"id":8,"status":"queued",` +
+		`"labels":["ubuntu-latest"]},` +
+		`"repository":{"full_name":"sproncy/app","name":"app","owner":{"login":"sproncy","type":"Organization"}}}`
+	rec := post(t, srv, "sproncy", "workflow_job", sign("s3cr3t", []byte(body)), body)
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want 204", rec.Code)
+	}
+	if !srv.drain(time.Second) {
+		t.Error("a github-hosted job started a dispatch, but should not have")
+	}
+}
+
+// A job asking for a strict subset of the owner's labels is the normal
+// case and must still dispatch. Without this the pre-check could refuse
+// everything and every other test here would still pass.
+func TestHandleWebhook_SubsetLabelsStillDispatched(t *testing.T) {
+	srv := testServer("s3cr3t")
+	body := `{"action":"queued","workflow_job":{"id":9,"status":"queued",` +
+		`"labels":["self-hosted"]},` +
+		`"repository":{"full_name":"sproncy/app","name":"app","owner":{"login":"sproncy","type":"Organization"}}}`
+	rec := post(t, srv, "sproncy", "workflow_job", sign("s3cr3t", []byte(body)), body)
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want 202", rec.Code)
+	}
+	if !srv.drain(5 * time.Second) {
+		t.Error("background dispatch did not finish")
+	}
+}
+
+// A payload carrying no labels at all is dispatched rather than
+// skipped. The dispatcher fires once per queued delivery and nothing
+// re-examines a job it declined, so an unrecognised payload shape must
+// not be able to strand jobs silently. See labels.Set.CanServe.
+func TestHandleWebhook_MissingLabelsDispatched(t *testing.T) {
+	srv := testServer("s3cr3t")
+	body := `{"action":"queued","workflow_job":{"id":10,"status":"queued"},` +
+		`"repository":{"full_name":"sproncy/app","name":"app","owner":{"login":"sproncy","type":"Organization"}}}`
 	rec := post(t, srv, "sproncy", "workflow_job", sign("s3cr3t", []byte(body)), body)
 	if rec.Code != http.StatusAccepted {
 		t.Errorf("status = %d, want 202", rec.Code)

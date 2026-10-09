@@ -71,7 +71,13 @@ file; private keys are referenced by path and mounted alongside).
   "defaults": {
     "runner_image": "ghcr.io/nkg/oci-actions-runner:v0.1.0", // required
     "runner_cpu_mhz": 2000,                // optional, default 2000
-    "runner_memory_mb": 2048               // optional, default 2048
+    "runner_memory_mb": 2048,              // optional, default 2048
+    "runner_volumes": [                    // optional, extra podman bind mounts
+      "/var/cache/uv:/var/cache/uv:rw"     //   appended after the podman socket
+    ],
+    "runner_env": {                        // optional, extra env for every runner
+      "UV_CACHE_DIR": "/var/cache/uv"
+    }
   },
   "owners": [
     {
@@ -84,6 +90,8 @@ file; private keys are referenced by path and mounted alongside).
       "runner_labels": "self-hosted,linux,x64,podman,sproncy",
       "nomad_namespace": "sproncy"         // optional, default "default"
       // "runner_image": "…"               // optional per-owner override
+      // "runner_volumes": […]             // optional per-owner override, REPLACES defaults
+      // "runner_env": {…}                 // optional per-owner override, MERGES over defaults
     },
     {
       "login": "nkg",                      // personal user account
@@ -101,6 +109,14 @@ file; private keys are referenced by path and mounted alongside).
 Per-owner `type` must be `"organization"` or `"user"`. The user's App
 needs repo **Administration: write** to mint repo-scoped registration
 tokens; orgs need org self-hosted-runner write.
+
+`runner_volumes` entries are podman `host:container[:opts]` specs and
+are mounted into every runner after the always-present podman socket;
+the host path must exist on every Nomad client. `runner_env` keys
+must be shell identifiers (`[A-Za-z_][A-Za-z0-9_]*`) and may not
+restate the `RUNNER_*` variables the dispatcher sets itself. Both are
+validated at load, so a bad entry fails startup with the key named
+rather than failing every dispatch with Nomad's parse error.
 
 ## Endpoints
 

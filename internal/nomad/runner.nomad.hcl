@@ -33,8 +33,14 @@ job "@@JOB_ID@@" {
         # most workflows. Easiest path is mount the host's podman
         # socket; alternatives (DinD) come later if isolation needs
         # tightening.
+        #
+        # Operator-configured mounts (runner_volumes in config, e.g. an
+        # NFS-backed package cache) follow the socket. The placeholder
+        # sits on the socket's line because each extra is rendered with
+        # its own leading comma, which keeps the list valid HCL whether
+        # there are none or many.
         volumes = [
-          "/run/podman/podman.sock:/var/run/docker.sock:rw"
+          "/run/podman/podman.sock:/var/run/docker.sock:rw"@@EXTRA_VOLUMES@@
         ]
       }
 
@@ -57,6 +63,12 @@ job "@@JOB_ID@@" {
         RUNNER_REMOVE_TOKEN = "@@REMOVE_TOKEN@@"
         # The runner image is expected to honour these env vars in
         # its entrypoint and shell out to `config.sh` + `run.sh`.
+        #
+        # Operator-configured extras (runner_env in config), e.g.
+        # UV_CACHE_DIR pointing at a mount from runner_volumes. The
+        # config loader rejects keys that collide with the RUNNER_*
+        # vars above, so this cannot redefine an attribute.
+        @@EXTRA_ENV@@
       }
 
       resources {

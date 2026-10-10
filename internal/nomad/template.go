@@ -3,6 +3,7 @@ package nomad
 import (
 	_ "embed"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -71,12 +72,28 @@ type RunnerJobInputs struct {
 	// before this field existed; an older image that does not read
 	// RUNNER_REMOVE_TOKEN does the same whatever is passed.
 	RemoveToken string
+
+	// Volumes are extra podman bind mounts ("host:container[:opts]")
+	// appended after the always-present podman socket mount. The
+	// socket stays first and unconditional because every workflow that
+	// builds an image depends on it; operators add to it (an NFS
+	// package cache, say), they do not replace it.
+	Volumes []string
+
+	// Env is injected alongside the fixed RUNNER_* vars, one attribute
+	// per entry, keys sorted so the rendered jobspec is stable across
+	// dispatches. Keys are assumed valid HCL identifiers — the config
+	// loader enforces that — and values are escaped for an HCL quoted
+	// string.
+	Env map[string]string
 }
 
 // Render substitutes the inputs into the embedded template and
 // returns the resulting HCL. Templating is done with plain string
 // replacement — no template engine — because every field is a known
-// fixed identifier that doesn't need escaping logic.
+// fixed identifier that doesn't need escaping logic. The two list
+// fields (Volumes, Env) are the exception: they are rendered to HCL
+// fragments first and substituted as a block.
 //
 // If the template ever grows conditional blocks or loops, swap to
 // text/template at that point.
@@ -96,9 +113,56 @@ func Render(in RunnerJobInputs) (string, error) {
 		"@@CPU@@":           fmt.Sprintf("%d", in.CPU),
 		"@@MEMORY@@":        fmt.Sprintf("%d", in.Memory),
 		"@@IDLE_TIMEOUT@@":  fmt.Sprintf("%d", in.IdleTimeout),
+		"@@EXTRA_VOLUMES@@": renderVolumes(in.Volumes),
+		"@@EXTRA_ENV@@":     renderEnv(in.Env),
 	}
 	for k, v := range replacements {
 		out = strings.ReplaceAll(out, k, v)
 	}
 	return out, nil
+}
+
+// renderVolumes produces the list-tail that follows the socket mount
+// in the template: each extra as a leading ",\n" plus a quoted entry,
+// so an empty list renders as nothing and a non-empty one never leaves
+// a trailing comma.
+func renderVolumes(vols []string) string {
+	var b strings.Builder
+	for _, v := range vols {
+		b.WriteString(",\n          ")
+		b.WriteString(hclQuote(v))
+	}
+	return b.String()
+}
+
+// renderEnv produces one `KEY = "value"` attribute per entry, sorted
+// by key. The first line lands where the placeholder sat; subsequent
+// lines carry the env block's indentation themselves.
+func renderEnv(env map[string]string) string {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	lines := make([]string, 0, len(keys))
+	for _, k := range keys {
+		lines = append(lines, k+" = "+hclQuote(env[k]))
+	}
+	return strings.Join(lines, "\n        ")
+}
+
+// hclQuote wraps s as an HCL quoted string. Backslash and double quote
+// are the two characters that would end or corrupt the literal; a raw
+// newline is also escaped because an HCL quoted string cannot span
+// lines. Nothing else is touched — in particular `${` is passed
+// through, so an operator can still reference Nomad runtime variables
+// such as ${NOMAD_ALLOC_DIR} on purpose.
+func hclQuote(s string) string {
+	r := strings.NewReplacer(
+		`\`, `\\`,
+		`"`, `\"`,
+		"\n", `\n`,
+		"\r", `\r`,
+	)
+	return `"` + r.Replace(s) + `"`
 }

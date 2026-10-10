@@ -319,6 +319,8 @@ func (s *server) dispatch(ctx context.Context, log *slog.Logger, owner *config.O
 		CPU:          s.cfg.DefaultCPU,
 		Memory:       s.cfg.DefaultMemory,
 		IdleTimeout:  s.cfg.DefaultIdleTimeout,
+		Volumes:      owner.RunnerVolumes,
+		Env:          owner.RunnerEnv,
 	})
 	if err != nil {
 		return fmt.Errorf("render job: %w", err)

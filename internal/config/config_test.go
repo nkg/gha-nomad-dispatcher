@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -225,5 +226,116 @@ func TestLoad_RejectsUnknownField(t *testing.T) {
 	_, err := loadJSON(t, body)
 	if err == nil || !strings.Contains(err.Error(), "bogus") {
 		t.Fatalf("want unknown-field error, got %v", err)
+	}
+}
+
+// runner_volumes and runner_env resolve differently on purpose: an
+// owner's volume list REPLACES the defaults, an owner's env MERGES
+// over them. Both are validated at load so a bad entry fails here,
+// with the key named, rather than at every dispatch with Nomad's
+// parse error.
+func TestLoad_RunnerVolumesAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := writeKey(t, dir)
+
+	// body builds a config with the given defaults fragment and one
+	// "acme" owner carrying the given extra fields (both fragments are
+	// raw JSON members; empty means none).
+	body := func(defaults, ownerExtra string) string {
+		if defaults != "" {
+			defaults = ", " + defaults
+		}
+		if ownerExtra != "" {
+			ownerExtra = ", " + ownerExtra
+		}
+		return fmt.Sprintf(`{
+          "nomad_addr": "http://n:4646",
+          "defaults": { "runner_image": "img"%s },
+          "owners": [{ "login": "acme", "type": "organization", "app_id": "1",
+            "installation_id": 1, "private_key_path": %q,
+            "webhook_secret": "s", "runner_labels": "l"%s }]
+        }`, defaults, keyPath, ownerExtra)
+	}
+
+	cases := []struct {
+		name        string
+		defaults    string
+		owner       string
+		wantVolumes []string
+		wantEnv     map[string]string
+		wantErr     string // substring; empty means Load must succeed
+	}{
+		{
+			name:        "neither set",
+			wantVolumes: nil,
+			wantEnv:     map[string]string{},
+		},
+		{
+			name:        "defaults only",
+			defaults:    `"runner_volumes": ["/var/cache/uv:/var/cache/uv:rw"], "runner_env": {"UV_CACHE_DIR": "/var/cache/uv"}`,
+			wantVolumes: []string{"/var/cache/uv:/var/cache/uv:rw"},
+			wantEnv:     map[string]string{"UV_CACHE_DIR": "/var/cache/uv"},
+		},
+		{
+			name:        "owner volumes replace defaults",
+			defaults:    `"runner_volumes": ["/var/cache/uv:/var/cache/uv:rw", "/srv/a:/a:ro"]`,
+			owner:       `"runner_volumes": ["/srv/b:/b"]`,
+			wantVolumes: []string{"/srv/b:/b"},
+			wantEnv:     map[string]string{},
+		},
+		{
+			name:        "owner env merges over defaults, owner wins",
+			defaults:    `"runner_env": {"UV_CACHE_DIR": "/var/cache/uv", "KEEP": "default"}`,
+			owner:       `"runner_env": {"UV_CACHE_DIR": "/mnt/other", "EXTRA": "1"}`,
+			wantVolumes: nil,
+			wantEnv:     map[string]string{"UV_CACHE_DIR": "/mnt/other", "KEEP": "default", "EXTRA": "1"},
+		},
+		{
+			name:     "invalid env key in defaults",
+			defaults: `"runner_env": {"NOT-VALID": "x"}`,
+			wantErr:  `defaults.runner_env: key "NOT-VALID"`,
+		},
+		{
+			name:    "invalid env key on owner",
+			owner:   `"runner_env": {"1LEADING": "x"}`,
+			wantErr: `owners[0] ("acme"): runner_env: key "1LEADING"`,
+		},
+		{
+			name:    "reserved env key",
+			owner:   `"runner_env": {"RUNNER_TOKEN": "x"}`,
+			wantErr: `key "RUNNER_TOKEN" is set by the dispatcher`,
+		},
+		{
+			name:     "volume without separator in defaults",
+			defaults: `"runner_volumes": ["/var/cache/uv"]`,
+			wantErr:  `defaults.runner_volumes: [0] "/var/cache/uv" is not host:container`,
+		},
+		{
+			name:    "volume without separator on owner",
+			owner:   `"runner_volumes": ["/ok:/ok", "bare"]`,
+			wantErr: `owners[0] ("acme"): runner_volumes: [1] "bare" is not host:container`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadJSON(t, body(tc.defaults, tc.owner))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			o := cfg.Owners["acme"]
+			if !reflect.DeepEqual(o.RunnerVolumes, tc.wantVolumes) {
+				t.Errorf("RunnerVolumes = %#v, want %#v", o.RunnerVolumes, tc.wantVolumes)
+			}
+			if !reflect.DeepEqual(o.RunnerEnv, tc.wantEnv) {
+				t.Errorf("RunnerEnv = %#v, want %#v", o.RunnerEnv, tc.wantEnv)
+			}
+		})
 	}
 }

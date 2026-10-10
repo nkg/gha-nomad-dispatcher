@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/nkg/gha-nomad-dispatcher/internal/github"
@@ -47,6 +48,20 @@ type Owner struct {
 	// default.
 	RunnerImage string
 
+	// RunnerVolumes are extra podman bind mounts ("host:container[:opts]")
+	// added to every runner container after the always-present podman
+	// socket. The owner list, if set, REPLACES the default list: a
+	// tenant that needs a different mount set is better served by
+	// restating it than by a merge nobody can read off the config.
+	RunnerVolumes []string
+
+	// RunnerEnv is injected into every runner container alongside the
+	// fixed RUNNER_* vars. Owner entries MERGE over the defaults, key by
+	// key — env is naturally additive, and the common case is one
+	// tenant tweaking one value (a cache dir) without restating the
+	// rest.
+	RunnerEnv map[string]string
+
 	// NomadNamespace to submit this owner's runner jobs into.
 	NomadNamespace string
 
@@ -81,22 +96,26 @@ type fileConfig struct {
 }
 
 type fileDefaults struct {
-	RunnerImage       string `json:"runner_image"`
-	RunnerCPUMHz      int    `json:"runner_cpu_mhz"`
-	RunnerMemoryMB    int    `json:"runner_memory_mb"`
-	RunnerIdleTimeout int    `json:"runner_idle_timeout"`
+	RunnerImage       string            `json:"runner_image"`
+	RunnerCPUMHz      int               `json:"runner_cpu_mhz"`
+	RunnerMemoryMB    int               `json:"runner_memory_mb"`
+	RunnerIdleTimeout int               `json:"runner_idle_timeout"`
+	RunnerVolumes     []string          `json:"runner_volumes"` // optional, "host:container[:opts]"
+	RunnerEnv         map[string]string `json:"runner_env"`     // optional
 }
 
 type fileOwner struct {
-	Login          string `json:"login"`
-	Type           string `json:"type"` // "organization" | "user"
-	AppID          string `json:"app_id"`
-	InstallationID int64  `json:"installation_id"`
-	PrivateKeyPath string `json:"private_key_path"`
-	WebhookSecret  string `json:"webhook_secret"`
-	RunnerLabels   string `json:"runner_labels"`
-	NomadNamespace string `json:"nomad_namespace"`
-	RunnerImage    string `json:"runner_image"` // optional per-owner override
+	Login          string            `json:"login"`
+	Type           string            `json:"type"` // "organization" | "user"
+	AppID          string            `json:"app_id"`
+	InstallationID int64             `json:"installation_id"`
+	PrivateKeyPath string            `json:"private_key_path"`
+	WebhookSecret  string            `json:"webhook_secret"`
+	RunnerLabels   string            `json:"runner_labels"`
+	NomadNamespace string            `json:"nomad_namespace"`
+	RunnerImage    string            `json:"runner_image"`   // optional per-owner override
+	RunnerVolumes  []string          `json:"runner_volumes"` // optional per-owner override (replaces defaults)
+	RunnerEnv      map[string]string `json:"runner_env"`     // optional per-owner override (merges over defaults)
 }
 
 // Load reads and validates the config file named by CONFIG_PATH
@@ -143,12 +162,18 @@ func parse(data []byte) (Config, error) {
 	if fc.Defaults.RunnerImage == "" {
 		return Config{}, fmt.Errorf("defaults.runner_image is required")
 	}
+	if err := validateVolumes(fc.Defaults.RunnerVolumes); err != nil {
+		return Config{}, fmt.Errorf("defaults.runner_volumes: %w", err)
+	}
+	if err := validateEnv(fc.Defaults.RunnerEnv); err != nil {
+		return Config{}, fmt.Errorf("defaults.runner_env: %w", err)
+	}
 	if len(fc.Owners) == 0 {
 		return Config{}, fmt.Errorf("at least one owner must be configured")
 	}
 
 	for i, fo := range fc.Owners {
-		owner, tenant, err := resolveOwner(fo, fc.Defaults.RunnerImage)
+		owner, tenant, err := resolveOwner(fo, fc.Defaults)
 		if err != nil {
 			return Config{}, fmt.Errorf("owners[%d] (%q): %w", i, fo.Login, err)
 		}
@@ -161,7 +186,7 @@ func parse(data []byte) (Config, error) {
 	return cfg, nil
 }
 
-func resolveOwner(fo fileOwner, defaultImage string) (*Owner, *github.Tenant, error) {
+func resolveOwner(fo fileOwner, defaults fileDefaults) (*Owner, *github.Tenant, error) {
 	login := strings.ToLower(strings.TrimSpace(fo.Login))
 	if login == "" {
 		return nil, nil, fmt.Errorf("login is required")
@@ -217,7 +242,33 @@ func resolveOwner(fo fileOwner, defaultImage string) (*Owner, *github.Tenant, er
 	}
 	image := strings.TrimSpace(fo.RunnerImage)
 	if image == "" {
-		image = defaultImage
+		image = defaults.RunnerImage
+	}
+
+	// Volumes: owner list replaces the defaults when present. A key
+	// absent from the JSON and an explicit empty list both decode to
+	// nil, so an owner cannot opt out of the default mounts by writing
+	// `[]` — restate the mounts wanted instead.
+	if err := validateVolumes(fo.RunnerVolumes); err != nil {
+		return nil, nil, fmt.Errorf("runner_volumes: %w", err)
+	}
+	volumes := fo.RunnerVolumes
+	if len(volumes) == 0 {
+		volumes = defaults.RunnerVolumes
+	}
+
+	// Env: owner entries merge over the defaults, owner winning on a
+	// shared key. Copied rather than aliased so two owners never share
+	// a map.
+	if err := validateEnv(fo.RunnerEnv); err != nil {
+		return nil, nil, fmt.Errorf("runner_env: %w", err)
+	}
+	env := make(map[string]string, len(defaults.RunnerEnv)+len(fo.RunnerEnv))
+	for k, v := range defaults.RunnerEnv {
+		env[k] = v
+	}
+	for k, v := range fo.RunnerEnv {
+		env[k] = v
 	}
 
 	tenant := &github.Tenant{
@@ -233,10 +284,58 @@ func resolveOwner(fo fileOwner, defaultImage string) (*Owner, *github.Tenant, er
 		RunnerLabels:   fo.RunnerLabels,
 		runnerLabelSet: labelSet,
 		RunnerImage:    image,
+		RunnerVolumes:  volumes,
+		RunnerEnv:      env,
 		NomadNamespace: namespace,
 		Tenant:         tenant,
 	}
 	return owner, tenant, nil
+}
+
+// envKeyRE is the POSIX shell identifier shape. The renderer writes
+// each key as a bare HCL attribute name, so anything looser would
+// produce a jobspec Nomad rejects at submit time — long after the
+// config was loaded and with no hint which key was at fault.
+var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// reservedEnvKeys are set by the job template itself. A duplicate
+// attribute in an HCL env block is a parse error, so a config that
+// restates one would fail every dispatch rather than load.
+var reservedEnvKeys = map[string]bool{
+	"RUNNER_URL":          true,
+	"RUNNER_TOKEN":        true,
+	"RUNNER_LABELS":       true,
+	"RUNNER_EPHEMERAL":    true,
+	"RUNNER_IDLE_TIMEOUT": true,
+	"RUNNER_REMOVE_TOKEN": true,
+}
+
+func validateEnv(env map[string]string) error {
+	for k := range env {
+		if !envKeyRE.MatchString(k) {
+			return fmt.Errorf("key %q is not a valid identifier ([A-Za-z_][A-Za-z0-9_]*)", k)
+		}
+		if reservedEnvKeys[k] {
+			return fmt.Errorf("key %q is set by the dispatcher and cannot be overridden", k)
+		}
+	}
+	return nil
+}
+
+// validateVolumes checks each spec has the "host:container[:opts]"
+// shape podman expects. Only the separator is checked: whether the
+// host path exists is a per-client question the dispatcher cannot
+// answer, and podman reports it clearly enough at task start.
+func validateVolumes(vols []string) error {
+	for i, v := range vols {
+		if strings.TrimSpace(v) == "" {
+			return fmt.Errorf("[%d] is empty", i)
+		}
+		if !strings.Contains(v, ":") {
+			return fmt.Errorf("[%d] %q is not host:container[:opts]", i, v)
+		}
+	}
+	return nil
 }
 
 // CanServe reports whether a runner spawned for this owner could claim
